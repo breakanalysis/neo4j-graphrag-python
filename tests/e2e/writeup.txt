@@ -1,0 +1,294 @@
+Incremental Entity Resolution Knowledge Graph Merging (with ANN support)
+
+We designed and benchmarked a skeleton pipeline for incremental entity resolution in knowledge graphs that uses approximate nearest neighbor search (ANNS) for candidate selection. The experiment simulates how a property graph can be updated batch by batch, where merges may occur simultaneously at several levels:
+	•	Graph structure: nodes are unified in a disjoint-set, collapsing duplicate entities.
+	•	Node properties: textual descriptions are combined using a merge policy.
+	•	Relationship types: relation identifiers are merged and canonicalized in a separate disjoint-set.
+	•	Vector indexes: only canonical representatives are inserted into HNSW ANN indexes; absorbed nodes and relations do not add vectors, ensuring the index tracks the evolving set of unique entities and relationship types.
+
+This unified merge process keeps the graph structure, metadata, and vector search index consistent as the knowledge graph grows.
+⸻
+Experimental setup: 
+	•	1000 virtual documents
+	•	1000 entities per document
+	•	25_000 triples per document of 500 relationship types
+	•	99% probability of merging each entity / relationship type 
+
+⸻
+
+What we measured
+	•	Timing for graph operations, vector indexing, vector search and triple remapping.
+	•	Number of vectors added vs avoided
+
+⸻
+
+Core ideas
+	• Nodes and Relationship Types
+		Each input batch contributes a fixed number of new nodes and relationship types.
+		Each is assigned:
+		A description string.
+		A random 300-dimensional vector.
+		Batches also generate triples (src, rel, trg) between their nodes.
+	• Two Disjoint Sets
+		One DisjointSet (ds) for entity IDs.
+		One DisjointSet (rt_ds) for relationship type IDs.
+		On merges, descriptions are combined with a merge policy (e.g. pick one at random).
+	• ANN Indexes
+		Two HNSW indexes (via Faiss): one for entities, one for relationship types.
+	• Workflow for each new element (entity or RT):
+		Run ANN search (top-k, K=10).
+		Pick one candidate → simulate LLM decision with probability 99% to merge.
+		Only canonical representatives are inserted into the index:
+		If merge occurs and the new node becomes the root → add its vector.
+		If merge occurs but the root is the old one → skip (vector avoided).
+		If no merge → add new vector.
+	        Empirically only a small fraction of vectors are added, thereby controlling index size and false positive rate.
+                (Moreover, retrieving a vector of a merge node is not a big problem as one can substitute via its root node).
+	• Canonicalization
+		After all batches, triples are remapped into their canonical representatives:
+                A triple (src, rel, trg) is remapped to (ds[src], rt_ds[rel], ds[trg]).
+⸻
+Limitations
+	• Should implement deduplication of identical triples at the end.
+	• Should consider more what are realistic settings
+	• In distributed system or parallell implementation, issues arise as vector index add is not thread-safe as is not disjoint set struct.
+          These could be singletons accessed via REST calls + mutex, but unclear if that is a path to pursue.
+          It may be sufficient to parallelise the entity extraction and keep the entity resolution single-threaded.
+	• Have not compared with single large ER on union of KGs from all documents 
+
+⸻
+
+Output
+
+Final #node components: 10063
+Final #rel components: 5124
+
+Timing (excluding vector gen):
+  Total build + merge DS: 22.17 s
+  Total index add time:   15.53 s
+  Total query time:       114.60 s
+  Triple remap time:      78.97 s
+
+Index stats:
+  Entity vectors added:   10063
+  Entity vectors avoided: 989937
+  Rel vectors added:      5124
+  Rel vectors avoided:    494876
+
+⸻
+
+Code
+
+import random
+import string
+import uuid
+import time
+import numpy as np
+import faiss
+from scipy.cluster.hierarchy import DisjointSet
+
+DEGREE = 25
+REL_TYPES_PER_UNIT = 500
+VEC_DIM = 300
+K = 10          # top-k for ANN search
+MERGE_PROB = 0.99
+
+def random_description(length=8):
+    return ''.join(random.choices(string.ascii_lowercase, k=length))
+
+def merge_descriptions(desc1, desc2):
+    return random.choice([desc1, desc2])
+
+def make_vector():
+    return np.random.randn(VEC_DIM).astype("float32")
+
+def main():
+    total_elements = 1_000_000   # smaller for demo; scale up as needed
+    subset_size = 1000
+    num_subsets = total_elements // subset_size
+
+    # Node disjoint set + descriptions
+    ds = DisjointSet()
+    node_descriptions = {}
+
+    # Relationship type disjoint set + descriptions
+    rt_ds = DisjointSet()
+    rel_descriptions = {}
+
+    # HNSW Faiss indexes
+    entity_index = faiss.IndexHNSWFlat(VEC_DIM, 32)
+    entity_index.hnsw.efSearch = 64
+    rel_index = faiss.IndexHNSWFlat(VEC_DIM, 32)
+    rel_index.hnsw.efSearch = 64
+
+    # Mappings: index order → IDs
+    entity_ids = []
+    rel_ids = []
+
+    # Counters for vectors
+    entity_added = 0
+    entity_avoided = 0
+    rel_added = 0
+    rel_avoided = 0
+
+    # Step 1: generate input sets, rel types, and triples
+    input_sets = []
+    subset_rel_types = []
+    triples = []
+
+    for _ in range(num_subsets):
+        nodes = [uuid.uuid4() for _ in range(subset_size)]
+        rels = [uuid.uuid4() for _ in range(REL_TYPES_PER_UNIT)]
+
+        for node in nodes:
+            node_descriptions[node] = random_description()
+        for rel in rels:
+            rel_descriptions[rel] = random_description()
+
+        for src in nodes:
+            for _ in range(DEGREE):
+                trg = random.choice(nodes)
+                rel = random.choice(rels)
+                triples.append((src, rel, trg))
+
+        input_sets.append(nodes)
+        subset_rel_types.append(rels)
+
+    print(f"Generated {len(triples):,} triples.")
+
+    # Step 2: build DS and do merges (exclude vector gen time)
+    t0 = time.time()
+    index_time = 0.0
+    query_time = 0.0
+
+    for set_id, input_set in enumerate(input_sets):
+        # process nodes
+        for elem in input_set:
+            ds.add(elem)
+            vec = make_vector()
+
+            if len(entity_ids) > 0:
+                # query nearest neighbors
+                q_start = time.time()
+                D, I = entity_index.search(vec.reshape(1, -1), K)
+                query_time += time.time() - q_start
+
+                cand_id = entity_ids[I[0][0]]
+                rep1, rep2 = ds[elem], ds[cand_id]
+
+                if rep1 != rep2 and random.random() < MERGE_PROB:
+                    ds.merge(rep1, rep2)
+                    new_rep = ds[rep1]
+
+                    merged_desc = merge_descriptions(
+                        node_descriptions[rep1], node_descriptions[rep2]
+                    )
+                    node_descriptions[new_rep] = merged_desc
+                    if rep1 != new_rep:
+                        node_descriptions.pop(rep1, None)
+                    if rep2 != new_rep:
+                        node_descriptions.pop(rep2, None)
+
+                    # if new node became root, add its vector
+                    if new_rep == elem:
+                        i_start = time.time()
+                        entity_index.add(vec.reshape(1, -1))
+                        entity_ids.append(new_rep)
+                        entity_added += 1
+                        index_time += time.time() - i_start
+                    else:
+                        entity_avoided += 1
+                else:
+                    i_start = time.time()
+                    entity_index.add(vec.reshape(1, -1))
+                    entity_ids.append(elem)
+                    entity_added += 1
+                    index_time += time.time() - i_start
+            else:
+                i_start = time.time()
+                entity_index.add(vec.reshape(1, -1))
+                entity_ids.append(elem)
+                entity_added += 1
+                index_time += time.time() - i_start
+
+        # process rel types
+        for rt in subset_rel_types[set_id]:
+            rt_ds.add(rt)
+            vec = make_vector()
+
+            if len(rel_ids) > 0:
+                q_start = time.time()
+                D, I = rel_index.search(vec.reshape(1, -1), K)
+                query_time += time.time() - q_start
+
+                cand_id = rel_ids[I[0][0]]
+                rep1, rep2 = rt_ds[rt], rt_ds[cand_id]
+
+                if rep1 != rep2 and random.random() < MERGE_PROB:
+                    rt_ds.merge(rep1, rep2)
+                    new_rep = rt_ds[rep1]
+
+                    merged_desc = merge_descriptions(
+                        rel_descriptions[rep1], rel_descriptions[rep2]
+                    )
+                    rel_descriptions[new_rep] = merged_desc
+                    if rep1 != new_rep:
+                        rel_descriptions.pop(rep1, None)
+                    if rep2 != new_rep:
+                        rel_descriptions.pop(rep2, None)
+
+                    if new_rep == rt:
+                        i_start = time.time()
+                        rel_index.add(vec.reshape(1, -1))
+                        rel_ids.append(new_rep)
+                        rel_added += 1
+                        index_time += time.time() - i_start
+                    else:
+                        rel_avoided += 1
+                else:
+                    i_start = time.time()
+                    rel_index.add(vec.reshape(1, -1))
+                    rel_ids.append(rt)
+                    rel_added += 1
+                    index_time += time.time() - i_start
+            else:
+                i_start = time.time()
+                rel_index.add(vec.reshape(1, -1))
+                rel_ids.append(rt)
+                rel_added += 1
+                index_time += time.time() - i_start
+
+        if (set_id + 1) % 10 == 0:
+            print(f"Processed {set_id + 1}/{num_subsets} subsets...")
+
+    t1 = time.time()
+
+    # Step 3: remap triples
+    remap_start = time.time()
+    remapped_triples = [(ds[src], rt_ds[rel], ds[trg]) for (src, rel, trg) in triples]
+    remap_end = time.time()
+
+    # Results
+    print("Final #node components:", ds.n_subsets)
+    print("Final #rel components:", rt_ds.n_subsets)
+    print("Sample node descriptions:", list(node_descriptions.items())[:5])
+    print("Sample rel descriptions:", list(rel_descriptions.items())[:5])
+    print("Sample remapped triples:", remapped_triples[:5])
+
+    print(f"\nTiming (excluding vector gen):")
+    build_merge_query_and_index_time = t1 - t0
+    build_and_merge_time = build_merge_query_and_index_time - index_time - query_time
+    print(f"  Total build + merge DS: {build_and_merge_time:.2f} s")
+    print(f"  Total index add time:   {index_time:.2f} s")
+    print(f"  Total query time:       {query_time:.2f} s")
+    print(f"  Triple remap time:      {remap_end - remap_start:.2f} s")
+
+    print(f"\nIndex stats:")
+    print(f"  Entity vectors added:   {entity_added}")
+    print(f"  Entity vectors avoided: {entity_avoided}")
+    print(f"  Rel vectors added:      {rel_added}")
+    print(f"  Rel vectors avoided:    {rel_avoided}")
+
+if __name__ == "__main__":
+    main()
+
